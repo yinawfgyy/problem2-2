@@ -1,0 +1,5 @@
+﻿stage,objective,reason,objective_value,best_bound,full_feasible_gap,proven_optimal_current_stage,runtime_s,solver_calls,full_feasible_solver_solutions,lock_tolerance
+1,weighted_tardiness,no_integer_solution_in_slice,96004.22290251666,3.637978807091713e-10,0.9999999999999962,False,183.21502709999913,30,0,1e-05
+2,makespan_s,stage_time_limit,8852.934858606857,383.1849787827681,0.9567166160259007,False,180.17045589999907,6,0,0.0001
+3,energy_kwh,no_integer_solution_in_slice,90.12749786671135,,,False,30.118665300004068,1,0,1e-07
+4,sorties,no_integer_solution_in_slice,37,,,False,30.10679739999614,1,0,0.0

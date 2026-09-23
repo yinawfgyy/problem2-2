@@ -1,0 +1,2 @@
+﻿solver,scipy_version,candidate_count,initial_variables,initial_constraints,final_variables,final_constraints,expanded_candidate_pairs,horizon_s,resource_big_m
+SciPy/HiGHS,1.18.1,850,8675,18022,15701,64306,3769,466967.9572369804,470134.2144669204

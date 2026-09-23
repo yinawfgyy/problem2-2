@@ -1,0 +1,19 @@
+﻿parameter,value
+code_version,Q2-candidate-joint-MILP-1.0
+run_id,20260923_191417_344885
+data_root,C:\Users\admin\Desktop\Math\problem\D题\数据
+protocol_root,C:\Users\admin\Desktop\Math\solve\2
+output_directory,C:\Users\admin\Desktop\Math\solve\problem2\outputs\20260923_191417_344885
+energy_formula_confirmed,True
+energy_formula_source,建模补充假设：水平能耗采用可用能量与等效航程比例；爬升能耗采用重力势能除以爬升效率。非已核验官方展开式。
+candidate_rounds,"[{""max_stops"": 2, ""budget"": 500}, {""max_stops"": 3, ""budget"": 850}]"
+max_boxes_per_candidate,10
+exact_order_limit,3
+time_limit_per_stage_s,180
+lex_tolerances,"[1e-05, 0.0001, 1e-07, 0.0]"
+battery_occupation_start,takeoff
+trip_start_definition,preparation_start
+delivery_definition,handover_complete
+alns_enabled,False
+trajectory_step_s,10.0
+command,C:\Users\admin\Desktop\Math\solve\problem2\question2_all.py

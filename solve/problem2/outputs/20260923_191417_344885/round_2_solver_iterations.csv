@@ -1,0 +1,39 @@
+﻿stage,objective,iteration,status_code,message,relaxation_objective,relaxation_dual_bound,relaxation_mip_gap,variables,linear_constraints,expanded_pairs_before,conflicting_pairs,new_pairs_added,full_feasible
+1,weighted_tardiness,1,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,8675,18023,256,265,265,False
+1,weighted_tardiness,2,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),8.731149137020111e-11,8.731149137020111e-11,0.0,9205,21283,521,212,212,False
+1,weighted_tardiness,3,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),5.820766091346741e-11,5.820766091346741e-11,0.0,9629,24115,733,446,446,False
+1,weighted_tardiness,4,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,10521,29843,1179,157,157,False
+1,weighted_tardiness,5,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,10835,31735,1336,223,223,False
+1,weighted_tardiness,6,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),4.3655745685100555e-11,4.3655745685100555e-11,0.0,11281,35371,1559,186,186,False
+1,weighted_tardiness,7,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),3.637978807091713e-10,3.637978807091713e-10,0.0,11653,37875,1745,214,214,False
+1,weighted_tardiness,8,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),3.055902197957039e-10,3.055902197957039e-10,0.0,12081,40635,1959,175,175,False
+1,weighted_tardiness,9,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,12431,43015,2134,53,53,False
+1,weighted_tardiness,10,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,12537,43659,2187,186,186,False
+1,weighted_tardiness,11,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,12909,46235,2373,39,39,False
+1,weighted_tardiness,12,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),1.0186340659856796e-10,1.0186340659856796e-10,0.0,12987,46711,2412,124,124,False
+1,weighted_tardiness,13,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,13235,48295,2536,62,62,False
+1,weighted_tardiness,14,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,13359,49063,2598,50,50,False
+1,weighted_tardiness,15,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),1.0913936421275139e-11,0.0,1.0,13459,49687,2648,51,51,False
+1,weighted_tardiness,16,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,13561,50419,2699,54,54,False
+1,weighted_tardiness,17,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),1.4551915228366852e-11,1.4551915228366852e-11,0.0,13669,51075,2753,161,161,False
+1,weighted_tardiness,18,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,13991,53319,2914,48,48,False
+1,weighted_tardiness,19,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14087,53895,2962,18,18,False
+1,weighted_tardiness,20,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14123,54119,2980,24,24,False
+1,weighted_tardiness,21,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14171,54407,3004,36,36,False
+1,weighted_tardiness,22,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14243,54847,3040,20,20,False
+1,weighted_tardiness,23,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14283,55095,3060,30,30,False
+1,weighted_tardiness,24,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14343,55463,3090,30,30,False
+1,weighted_tardiness,25,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),3.637978807091713e-10,3.637978807091713e-10,0.0,14403,55823,3120,102,102,False
+1,weighted_tardiness,26,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14607,57247,3222,50,50,False
+1,weighted_tardiness,27,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14707,57847,3272,15,15,False
+1,weighted_tardiness,28,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14737,58027,3287,21,21,False
+1,weighted_tardiness,29,0,Optimization terminated successfully. (HiGHS Status 7: Optimal),0.0,0.0,0.0,14779,58279,3308,23,23,False
+1,weighted_tardiness,30,1,Time limit reached. (HiGHS Status 13: model_status is Time limit reached; primal_status is None),,,,14825,58579,3331,,0,False
+2,makespan_s,1,1,Time limit reached. (HiGHS Status 13: Time limit reached),3305.162853522686,383.1849787827681,0.8840647206311287,14825,58581,3331,75,75,False
+2,makespan_s,2,1,Time limit reached. (HiGHS Status 13: Time limit reached),2904.1064393344304,382.54951285028847,0.8682729022363375,14975,59585,3406,63,63,False
+2,makespan_s,3,1,Time limit reached. (HiGHS Status 13: Time limit reached),3318.292850661312,382.5495128502884,0.8847149633661631,15101,60397,3469,62,62,False
+2,makespan_s,4,1,Time limit reached. (HiGHS Status 13: Time limit reached),3271.98146214442,382.54951285028847,0.8830832273115723,15225,61197,3531,78,78,False
+2,makespan_s,5,1,Time limit reached. (HiGHS Status 13: Time limit reached),3393.5287808393227,382.5495128502885,0.8872708800908792,15381,62269,3609,92,92,False
+2,makespan_s,6,1,Time limit reached. (HiGHS Status 13: Time limit reached),4569.535330106085,382.54951285028847,0.9162826228019539,15565,63437,3701,68,68,False
+3,energy_kwh,1,1,Time limit reached. (HiGHS Status 13: model_status is Time limit reached; primal_status is None),,,,15701,64303,3769,,0,False
+4,sorties,1,1,Time limit reached. (HiGHS Status 13: model_status is Time limit reached; primal_status is None),,,,15701,64305,3769,,0,False

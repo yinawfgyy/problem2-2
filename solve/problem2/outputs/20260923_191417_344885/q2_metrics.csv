@@ -1,0 +1,2 @@
+﻿weighted_tardiness,transport_makespan_s,total_energy_kwh,sorties,delivered_boxes,run_id,label,solver,candidate_count,four_stages_completed,all_stages_proven_optimal,expanded_candidate_pairs,scope
+96004.22290251666,8852.934858606857,90.12749786671135,37,80,20260923_191417_344885,round_2,SciPy/HiGHS,850,True,False,3769,当前候选集合；连续时间；资源互斥约束增量生成；只有完整审计通过的方案才返回；最优性以分层日志为准

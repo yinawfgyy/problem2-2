@@ -1,0 +1,2207 @@
+# -*- coding: utf-8 -*-
+"""
+D题第二问：候选架次集合划分与无人机—共享电池联合时序优化
+文件名建议：q2_transport.py
+
+本程序只服务于第二问，不包含通信优化，不包含 ALNS，不求解第一问。
+
+依赖：
+    pip install numpy pandas openpyxl rasterio pyproj matplotlib gurobipy
+
+注意：
+1. Gurobi 需要能够支持本模型规模的有效许可证。
+2. 本代码尚未运行，不包含预设实验结果。
+3. 原题 DOCX 及全局符号表尚未给出经核验的水平、爬升能耗展开式。
+   下方完整实现了一个明确标记的“待核验展开式”，默认禁止据此求解。
+   必须核对 horizontal_energy_kwh() 和 climb_energy_kwh()，
+   填写 ENERGY_FORMULA_SOURCE，并将 ENERGY_FORMULA_CONFIRMED 改为 True。
+   不要仅为了跳过检查而修改确认开关。
+4. 主模型采用前文最终方案：
+   候选架次 + 联合 MILP + 字典序目标 + 独立审计。
+   文件中的 ALNS 属于旧方案，当前不启用。
+5. start_s 表示准备开始，电池从起飞时刻占用至返航并充满。
+6. 候选集合经过有限生成和截断，最优性只针对当前候选集合。
+7. 所有输出写入 OUTPUT_ROOT 下本次运行目录，不覆盖原始附件。
+"""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import itertools
+import json
+import logging
+import math
+import re
+import sys
+import time
+import traceback
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import openpyxl
+import rasterio
+from pyproj import Geod
+import gurobipy as gp
+from gurobipy import GRB
+
+
+# ============================================================
+# A. 配置：运行前主要修改这里
+# ============================================================
+
+PROJECT_ROOT = Path(r"C:\Users\admin\Desktop\Math")
+DATA_ROOT = PROJECT_ROOT / "problem" / "D题" / "数据"
+PROTOCOL_ROOT = PROJECT_ROOT / "solve" / "2"
+OUTPUT_ROOT = PROJECT_ROOT / "problem2"
+
+# 能耗分项仍需与正式题面/已核验公共物理层核对。
+ENERGY_FORMULA_CONFIRMED = False
+ENERGY_FORMULA_SOURCE = ""
+
+# 候选生成参数，仅限制搜索范围，不是题目物理约束。
+# 第二轮继承第一轮全部候选，并允许更多服务区。
+CANDIDATE_ROUNDS = [
+    {"max_stops": 2, "budget": 500},
+    {"max_stops": 3, "budget": 850},
+]
+MAX_BOXES_PER_CANDIDATE = 10
+EXACT_ORDER_LIMIT = 3
+
+# 每轮每层目标的求解时限。
+TIME_LIMIT_PER_STAGE_S = 180
+THREADS = 0
+RANDOM_SEED = 20260923
+
+# 字典序各层容差：
+# 加权迟到、完工时间、能耗、架次数。
+LEX_TOLERANCES = [1e-5, 1e-4, 1e-7, 0.0]
+
+AUDIT_TIME_TOL_S = 1e-3
+AUDIT_ENERGY_TOL_KWH = 1e-6
+PHYSICAL_TOL = 1e-9
+
+TRAJECTORY_STEP_S = 10.0
+FIGURE_DPI = 300
+SHOW_FIGURES = True
+
+# 如自动找不到中文字体，可填写本机字体文件。
+CHINESE_FONT_PATH = ""
+
+CODE_VERSION = "Q2-candidate-joint-MILP-1.0"
+
+PROTOCOL_FILES = [
+    "00_全局符号表.md",
+    "01_全局建模方案.md",
+    "03_Q2_多点运输调度方案.md",
+    "06_分工与接口清单.md",
+]
+
+
+# ============================================================
+# B. 通用工具
+# ============================================================
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def clean(value):
+    return value.strip() if isinstance(value, str) else value
+
+
+def number(value, label, positive=False, nonnegative=False):
+    require(
+        isinstance(value, (int, float, np.number))
+        and not isinstance(value, bool),
+        f"{label} 应为数值，实际为 {value!r}",
+    )
+    value = float(value)
+    require(math.isfinite(value), f"{label} 不是有限数")
+    if positive:
+        require(value > 0, f"{label} 必须大于0")
+    if nonnegative:
+        require(value >= 0, f"{label} 不能为负")
+    return value
+
+
+def integer(value, label, positive=False):
+    x = number(value, label, nonnegative=not positive, positive=positive)
+    require(abs(x - round(x)) < 1e-9, f"{label} 应为整数")
+    return int(round(x))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while True:
+            block = f.read(1024 * 1024)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def write_csv(path, records, columns=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records = list(records)
+    if columns is None:
+        columns = list(records[0]) if records else ["message"]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def encode_list(values):
+    return json.dumps(list(values), ensure_ascii=False)
+
+
+def init_logging(out):
+    logger = logging.getLogger("Q2")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for handler in [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(out / "run.log", encoding="utf-8"),
+    ]:
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+def workbook_rows(path, sheet):
+    """只读取原始工作簿，不写回；检查Excel错误及无缓存公式。"""
+    wf = openpyxl.load_workbook(path, data_only=False)
+    wv = openpyxl.load_workbook(path, data_only=True)
+    try:
+        require(sheet in wf.sheetnames, f"{path.name} 缺少工作表 {sheet}")
+        sf, sv = wf[sheet], wv[sheet]
+        for row in sf:
+            for cell in row:
+                require(
+                    cell.data_type != "e",
+                    f"{path.name}/{sheet}/{cell.coordinate} 存在Excel错误",
+                )
+                if cell.data_type == "f":
+                    require(
+                        sv[cell.coordinate].value is not None,
+                        f"{path.name}/{sheet}/{cell.coordinate} 公式无缓存值",
+                    )
+        return [
+            tuple(clean(v) for v in row)
+            for row in sv.iter_rows(values_only=True)
+        ]
+    finally:
+        wf.close()
+        wv.close()
+
+
+def records_from_header(rows, first_header, expected_headers):
+    positions = [
+        i for i, row in enumerate(rows)
+        if row and row[0] == first_header
+        and list(row[:len(expected_headers)]) == expected_headers
+    ]
+    require(len(positions) == 1, f"表头不唯一或不匹配：{first_header}")
+    start = positions[0] + 1
+    result = []
+    for row in rows[start:]:
+        if not row or row[0] is None:
+            break
+        result.append(dict(zip(expected_headers, row[:len(expected_headers)])))
+    return result
+
+
+def unique_insert(container, key, value, label):
+    require(key not in container, f"{label}编号重复：{key}")
+    container[key] = value
+
+
+def raw_metrics(physics, schedule):
+    if not schedule:
+        return None
+    delivery = {}
+    for item in schedule:
+        c = item["candidate"]
+        for b, offset in c.delivery_offset_s.items():
+            delivery[b] = item["start_s"] + offset
+    return (
+        sum(
+            physics.data.priority_weight[b]
+            * max(0.0, t - physics.data.expected_delivery_s[b])
+            for b, t in delivery.items()
+        ),
+        max(
+            item["start_s"] + item["candidate"].duration_s
+            for item in schedule
+        ),
+        sum(item["candidate"].energy_kwh for item in schedule),
+        len(schedule),
+    )
+
+
+# ============================================================
+# C. 数据读取与预处理
+# ============================================================
+
+class InputData:
+    def __init__(self, data_root, out, logger):
+        self.data_root = Path(data_root)
+        self.out = Path(out)
+        self.logger = logger
+
+        self.nodes = {}
+        self.cargo = {}
+        self.uav_types = {}
+        self.uavs = {}
+        self.batteries = {}
+        self.source_files = []
+        self.data_checks = []
+
+        self._read_nodes()
+        self._read_cargo()
+        self._read_uavs()
+        self._validate()
+        self._make_symbol_dictionaries()
+        self._export()
+
+    def source(self, name):
+        path = (
+            self.data_root
+            / "无人机应急物资运输基础数据"
+            / f"{name}.xlsx"
+        )
+        require(path.is_file(), f"缺少附件：{path}")
+        if path not in self.source_files:
+            self.source_files.append(path)
+        return path
+
+    def check(self, name, passed, detail):
+        self.data_checks.append({
+            "check": name,
+            "passed": bool(passed),
+            "detail": detail,
+        })
+        require(passed, f"数据检查失败：{name}；{detail}")
+
+    def _read_nodes(self):
+        rows = workbook_rows(self.source("调度中心与服务区"), "数据")
+        for r in rows:
+            if not isinstance(r[0], str):
+                continue
+            if r[0] != "O01" and not re.fullmatch(r"S\d{3}", r[0]):
+                continue
+            identifier = r[0]
+            lon = number(r[2], f"{identifier}经度")
+            lat = number(r[3], f"{identifier}纬度")
+            require(-180 <= lon <= 180 and -90 <= lat <= 90,
+                    f"{identifier}经纬度越界")
+            z = number(r[4], f"{identifier}海拔")
+            population = (
+                None if identifier == "O01"
+                else integer(r[5], f"{identifier}保障人口", positive=True)
+            )
+            unique_insert(
+                self.nodes, identifier,
+                {
+                    "node_id": identifier,
+                    "name": r[1],
+                    "longitude_deg": lon,
+                    "latitude_deg": lat,
+                    "ground_elevation_m": z,
+                    "operation_altitude_m": z + (
+                        0.0 if identifier == "O01" else 30.0
+                    ),
+                    "population": population,
+                },
+                "节点",
+            )
+
+    def _read_cargo(self):
+        path = self.source("物资需求与配送时限")
+        headers = [
+            "货箱编号", "服务区编号", "物资类型",
+            "单箱质量（kg）", "单箱体积（m³）", "是否首批保障",
+            "首批截止时间（s）", "期望送达时间（s）", "应急优先系数",
+        ]
+        rows = workbook_rows(path, "逐箱货箱清单")
+        records = records_from_header(rows, "货箱编号", headers)
+
+        for r in records:
+            b = r["货箱编号"]
+            require(isinstance(b, str) and b, "货箱编号缺失")
+            flag = r["是否首批保障"]
+            require(flag in {"是", "否"}, f"{b}首批标志非法")
+            first = flag == "是"
+            medical = r["物资类型"] == "医疗物资"
+
+            deadline = r["首批截止时间（s）"]
+            if first:
+                deadline = number(deadline, f"{b}首批截止", positive=True)
+            else:
+                require(deadline is None, f"{b}非首批箱却填写首批截止")
+
+            expected = number(
+                r["期望送达时间（s）"], f"{b}期望时间", positive=True
+            )
+            hard = []
+            if first:
+                hard.append(deadline)
+            if medical:
+                hard.append(expected)
+
+            unique_insert(
+                self.cargo, b,
+                {
+                    "cargo_id": b,
+                    "service_area": r["服务区编号"],
+                    "cargo_type": r["物资类型"],
+                    "cargo_weight_kg": number(
+                        r["单箱质量（kg）"], f"{b}质量", positive=True
+                    ),
+                    "cargo_volume_m3": number(
+                        r["单箱体积（m³）"], f"{b}体积", positive=True
+                    ),
+                    "is_first_batch": int(first),
+                    "is_medical": int(medical),
+                    "first_deadline_s": deadline,
+                    "expected_delivery_s": expected,
+                    "priority_weight": number(
+                        r["应急优先系数"], f"{b}优先系数", positive=True
+                    ),
+                    "hard_deadline_s": min(hard) if hard else None,
+                },
+                "货箱",
+            )
+
+        summary_headers = [
+            "服务区编号", "物资类型", "总需求箱数", "首批必须送达箱数",
+            "单箱质量（kg）", "单箱体积（m³）", "应急优先系数",
+            "首批截止时间（s）", "期望送达时间（s）",
+        ]
+        summary = records_from_header(
+            workbook_rows(path, "数据"), "服务区编号", summary_headers
+        )
+        seen = set()
+        for r in summary:
+            key = (r["服务区编号"], r["物资类型"])
+            require(key not in seen, f"需求汇总键重复：{key}")
+            seen.add(key)
+            boxes = [
+                b for b in self.cargo.values()
+                if (b["service_area"], b["cargo_type"]) == key
+            ]
+            require(len(boxes) == r["总需求箱数"], f"{key}箱数不一致")
+            require(
+                sum(b["is_first_batch"] for b in boxes)
+                == r["首批必须送达箱数"],
+                f"{key}首批数量不一致",
+            )
+            for b in boxes:
+                pairs = [
+                    ("cargo_weight_kg", "单箱质量（kg）"),
+                    ("cargo_volume_m3", "单箱体积（m³）"),
+                    ("priority_weight", "应急优先系数"),
+                    ("expected_delivery_s", "期望送达时间（s）"),
+                ]
+                for left, right in pairs:
+                    require(
+                        abs(b[left] - float(r[right])) < 1e-9,
+                        f"{b['cargo_id']}与汇总表字段不一致：{right}",
+                    )
+                if b["is_first_batch"]:
+                    require(
+                        b["first_deadline_s"] == r["首批截止时间（s）"],
+                        f"{b['cargo_id']}首批截止不一致",
+                    )
+        require(
+            seen == {
+                (b["service_area"], b["cargo_type"])
+                for b in self.cargo.values()
+            },
+            "需求汇总表与逐箱表的服务区—类型集合不一致",
+        )
+
+    def _read_uavs(self):
+        rows = workbook_rows(self.source("运输无人机数据"), "数据")
+        header = [
+            "机型编号", "机型名称", "含电池空载总质量（kg）",
+            "最大载货质量（kg）", "可用装载体积（m³）",
+            "计划巡航速度（m/s）", "空载标准航程（m）",
+            "满载标准航程（m）", "电池可用能量（kWh）",
+            "返航电量下限（%）", "工位固定准备时间（s）",
+            "每箱装载时间（s）", "接收点基础交接时间（s）",
+            "每箱增加交接时间（s）", "最大爬升速度（m/s）",
+            "最大下降速度（m/s）", "爬升能耗效率", "下降能耗效率",
+        ]
+        code_names = [
+            "uav_type", "name", "empty_mass_kg",
+            "max_payload_kg", "max_volume_m3", "cruise_speed_mps",
+            "empty_range_m", "full_range_m", "usable_energy_kwh",
+            "reserve_ratio", "prep_time_s", "load_time_per_box_s",
+            "handover_base_s", "handover_per_box_s",
+            "climb_speed_mps", "descent_speed_mps",
+            "climb_efficiency", "descent_efficiency",
+        ]
+        for r in records_from_header(rows, "机型编号", header):
+            record = dict(zip(code_names, [r[h] for h in header]))
+            g = record["uav_type"]
+            for key in code_names[2:]:
+                record[key] = number(
+                    record[key], f"{g}/{key}",
+                    nonnegative=(key == "descent_efficiency"),
+                    positive=(key != "descent_efficiency"),
+                )
+            record["reserve_ratio"] /= 100.0
+            require(0 < record["reserve_ratio"] < 1, f"{g}安全余量非法")
+            require(
+                record["empty_range_m"] >= record["full_range_m"],
+                f"{g}空满载航程关系异常",
+            )
+            require(0 < record["climb_efficiency"] <= 1,
+                    f"{g}爬升效率异常")
+            require(record["descent_efficiency"] == 0,
+                    "当前物理规则仅对应题设下降附加能耗为0")
+            unique_insert(self.uav_types, g, record, "机型")
+
+        for r in records_from_header(
+            rows, "无人机编号", ["无人机编号", "机型编号", "初始位置"]
+        ):
+            u = r["无人机编号"]
+            unique_insert(
+                self.uavs, u,
+                {
+                    "uav_id": u,
+                    "uav_type": r["机型编号"],
+                    "initial_node": r["初始位置"],
+                },
+                "实体无人机",
+            )
+
+        inventory = records_from_header(
+            rows, "机型编号",
+            ["机型编号", "共享电池组总数（组）", "等效完全充电时间（s）"],
+        )
+        inventory_types = set()
+        for r in inventory:
+            g = r["机型编号"]
+            require(g in self.uav_types and g not in inventory_types,
+                    f"电池库存机型非法或重复：{g}")
+            inventory_types.add(g)
+            count = integer(r["共享电池组总数（组）"], f"{g}电池数量", True)
+            full = number(
+                r["等效完全充电时间（s）"], f"{g}充电时间", positive=True
+            )
+            self.uav_types[g]["full_charge_time_s"] = full
+            for i in range(1, count + 1):
+                c = f"{g}{i:02d}"
+                self.batteries[c] = {
+                    "battery_id": c,
+                    "uav_type": g,
+                    "initial_soc": 1.0,
+                    "full_charge_time_s": full,
+                    "id_origin": "由附件库存派生",
+                }
+
+    def _validate(self):
+        self.check("节点数量", len(self.nodes) == 16, "O01与15个服务区")
+        self.check("货箱数量", len(self.cargo) == 80, "80个不可拆货箱")
+        self.check("机型集合", set(self.uav_types) == {"A", "B", "C"},
+                   "三种运输机型")
+        self.check("实体机数量", len(self.uavs) == 8, "8架实体运输机")
+        self.check("电池数量", len(self.batteries) == 14, "含初始及备用电池")
+
+        for b in self.cargo.values():
+            require(
+                b["service_area"] in self.nodes and b["service_area"] != "O01",
+                f"{b['cargo_id']}目的地不存在",
+            )
+        for u in self.uavs.values():
+            require(u["uav_type"] in self.uav_types, "实体机机型不存在")
+            require(u["initial_node"] == "O01", "实体机初始位置不为O01")
+
+        expected_uavs = {"A": 4, "B": 2, "C": 2}
+        expected_batteries = {"A": 6, "B": 4, "C": 4}
+        require(
+            Counter(u["uav_type"] for u in self.uavs.values())
+            == expected_uavs,
+            "实体机分机型库存与协议不一致",
+        )
+        require(
+            Counter(c["uav_type"] for c in self.batteries.values())
+            == expected_batteries,
+            "电池分机型库存与协议不一致",
+        )
+        self.check("汇总与逐箱一致性", True, "已逐条核对数量和属性")
+        self.check("对象主键与外键", True, "读取时检查，无按名称去重")
+
+    def _make_symbol_dictionaries(self):
+        # 与00_全局符号表.md建议代码名保持一致。
+        node_fields = [
+            "longitude_deg", "latitude_deg",
+            "ground_elevation_m", "operation_altitude_m",
+        ]
+        cargo_fields = [
+            "cargo_weight_kg", "cargo_volume_m3", "priority_weight",
+            "first_deadline_s", "expected_delivery_s",
+            "is_first_batch", "is_medical", "hard_deadline_s",
+        ]
+        type_fields = [
+            "empty_mass_kg", "max_payload_kg", "max_volume_m3",
+            "cruise_speed_mps", "climb_speed_mps", "descent_speed_mps",
+            "empty_range_m", "full_range_m", "usable_energy_kwh",
+            "reserve_ratio", "climb_efficiency", "prep_time_s",
+            "load_time_per_box_s", "handover_base_s",
+            "handover_per_box_s", "full_charge_time_s",
+        ]
+        for field in node_fields:
+            setattr(self, field, {i: r[field] for i, r in self.nodes.items()})
+        for field in cargo_fields:
+            setattr(self, field, {b: r[field] for b, r in self.cargo.items()})
+        for field in type_fields:
+            setattr(self, field, {g: r[field] for g, r in self.uav_types.items()})
+
+        self.service_area_of = {
+            b: r["service_area"] for b, r in self.cargo.items()
+        }
+        self.uavs_by_type = {
+            g: sorted(u for u, r in self.uavs.items() if r["uav_type"] == g)
+            for g in self.uav_types
+        }
+        self.batteries_by_type = {
+            g: sorted(c for c, r in self.batteries.items()
+                      if r["uav_type"] == g)
+            for g in self.uav_types
+        }
+
+    def _export(self):
+        for name, records in [
+            ("nodes", self.nodes),
+            ("cargo", self.cargo),
+            ("uav_types", self.uav_types),
+            ("uavs", self.uavs),
+            ("batteries", self.batteries),
+        ]:
+            write_csv(self.out / f"processed_{name}.csv", records.values())
+        write_csv(self.out / "input_audit.csv", self.data_checks)
+        self.logger.info(
+            "读取完成：节点%d，货箱%d，无人机%d，电池%d；总质量%.3f kg",
+            len(self.nodes), len(self.cargo), len(self.uavs),
+            len(self.batteries), sum(self.cargo_weight_kg.values()),
+        )
+
+
+# ============================================================
+# D. 公共物理层：DEM、航段、能耗、充电
+# ============================================================
+
+class Physics:
+    def __init__(self, data, out, logger):
+        self.data = data
+        self.out = out
+        self.logger = logger
+        paths = sorted(data.data_root.rglob("*.tif"))
+        require(len(paths) == 1, "请确保数据目录中只有一份目标DEM tif")
+        self.dem_path = paths[0]
+
+        with rasterio.open(self.dem_path) as src:
+            require(src.count == 1, "DEM应为单波段")
+            require(src.crs is not None and src.crs.to_epsg() == 4326,
+                    "DEM坐标系应为EPSG:4326")
+            self.dem = src.read(1, masked=True)
+            self.transform = src.transform
+            self.height, self.width = src.height, src.width
+            self.dem_tags = src.tags()
+
+        # GDAL/rasterio返回的transform已统一为像元角点变换。
+        # 对PixelIsPoint GeoTIFF不再人工加减半像元。
+        require(abs(self.transform.b) < 1e-12
+                and abs(self.transform.d) < 1e-12,
+                "当前直线像元遍历要求无旋转栅格")
+        self.inverse = ~self.transform
+        self.geod = Geod(ellps="WGS84")
+
+        self.horizontal_distance_m = {}
+        self.max_dem_elevation_m = {}
+        self.cruise_altitude_m = {}
+        self.climb_m = {}
+        self.descent_m = {}
+        self.flight_time_s = {}
+
+        self._build_segments()
+
+    def pixel_xy(self, lon, lat):
+        return self.inverse * (lon, lat)
+
+    @staticmethod
+    def touching_indices(value):
+        nearest = round(value)
+        if abs(value - nearest) <= 1e-9:
+            return [nearest - 1, nearest]
+        return [math.floor(value)]
+
+    def segment_cells(self, i, j):
+        """按栅格边界切分直线，保留边界接触像元，不用稀疏采样代替。"""
+        d = self.data
+        x0, y0 = self.pixel_xy(d.longitude_deg[i], d.latitude_deg[i])
+        x1, y1 = self.pixel_xy(d.longitude_deg[j], d.latitude_deg[j])
+
+        for x, y in [(x0, y0), (x1, y1)]:
+            require(0 <= x < self.width and 0 <= y < self.height,
+                    f"节点或航段端点超出DEM：{i}->{j}")
+
+        cuts = [0.0, 1.0]
+        for a, b in [(x0, x1), (y0, y1)]:
+            if abs(b - a) > 1e-12:
+                for edge in range(
+                    math.floor(min(a, b)) + 1,
+                    math.ceil(max(a, b)),
+                ):
+                    t = (edge - a) / (b - a)
+                    if 0 < t < 1:
+                        cuts.append(t)
+
+        cuts = sorted(set(cuts))
+        probes = cuts + [
+            (a + b) / 2 for a, b in zip(cuts[:-1], cuts[1:])
+        ]
+        cells = set()
+        for t in probes:
+            x = x0 + (x1 - x0) * t
+            y = y0 + (y1 - y0) * t
+            for col in self.touching_indices(x):
+                for row in self.touching_indices(y):
+                    if 0 <= row < self.height and 0 <= col < self.width:
+                        cells.add((row, col))
+        require(bool(cells), f"未找到航段像元：{i}->{j}")
+        return cells
+
+    def _build_segments(self):
+        d = self.data
+        rows = []
+        node_checks = []
+        for i in d.nodes:
+            col, row = self.pixel_xy(d.longitude_deg[i], d.latitude_deg[i])
+            require(0 <= col < self.width and 0 <= row < self.height,
+                    f"节点{i}超出DEM")
+            value = self.dem[math.floor(row), math.floor(col)]
+            require(not np.ma.is_masked(value) and np.isfinite(value),
+                    f"节点{i}落在无效DEM")
+            node_checks.append({
+                "node_id": i,
+                "table_ground_m": d.ground_elevation_m[i],
+                "dem_ground_m": float(value),
+                "difference_m": d.ground_elevation_m[i] - float(value),
+            })
+
+        for i, j in itertools.permutations(d.nodes, 2):
+            cells = self.segment_cells(i, j)
+            elevations = []
+            for row, col in cells:
+                z = self.dem[row, col]
+                require(not np.ma.is_masked(z) and np.isfinite(z),
+                        f"{i}->{j}经过无效DEM，不能插补后直接飞行")
+                elevations.append(float(z))
+            max_dem = max(elevations)
+            cruise = max_dem + 50.0
+            up = cruise - d.operation_altitude_m[i]
+            down = cruise - d.operation_altitude_m[j]
+            require(up >= -1e-8 and down >= -1e-8,
+                    f"{i}->{j}巡航海拔低于作业高度，请检查海拔口径")
+            _, _, distance = self.geod.inv(
+                d.longitude_deg[i], d.latitude_deg[i],
+                d.longitude_deg[j], d.latitude_deg[j],
+            )
+            self.horizontal_distance_m[i, j] = distance
+            self.max_dem_elevation_m[i, j] = max_dem
+            self.cruise_altitude_m[i, j] = cruise
+            self.climb_m[i, j] = max(0.0, up)
+            self.descent_m[i, j] = max(0.0, down)
+
+            for g in d.uav_types:
+                ft = (
+                    self.climb_m[i, j] / d.climb_speed_mps[g]
+                    + distance / d.cruise_speed_mps[g]
+                    + self.descent_m[i, j] / d.descent_speed_mps[g]
+                )
+                self.flight_time_s[g, i, j] = ft
+                rows.append({
+                    "from_node": i,
+                    "to_node": j,
+                    "distance_m": distance,
+                    "max_dem_m": max_dem,
+                    "cruise_altitude_m": cruise,
+                    "climb_m": self.climb_m[i, j],
+                    "descent_m": self.descent_m[i, j],
+                    "uav_type": g,
+                    "flight_time_s": ft,
+                })
+        write_csv(self.out / "segment_physics.csv", rows)
+        write_csv(self.out / "node_dem_checks.csv", node_checks)
+        self.logger.info("已建立240条有向航段、720条机型—航段记录")
+
+    def equivalent_range_m(self, g, q):
+        d = self.data
+        require(-PHYSICAL_TOL <= q <= d.max_payload_kg[g] + PHYSICAL_TOL,
+                f"{g}载荷越界：{q}")
+        q = max(0.0, q)
+        return (
+            d.empty_range_m[g]
+            - (d.empty_range_m[g] - d.full_range_m[g])
+            * (q / d.max_payload_kg[g]) ** 1.5
+        )
+
+    def horizontal_energy_kwh(self, g, i, j, q):
+        """
+        待核验展开式：
+            E_hor = E_use * distance / equivalent_range(q)
+        不是已确认的题面引文；必须通过配置区核验门禁。
+        """
+        return (
+            self.data.usable_energy_kwh[g]
+            * self.horizontal_distance_m[i, j]
+            / self.equivalent_range_m(g, q)
+        )
+
+    def climb_energy_kwh(self, g, i, j, q):
+        """
+        待核验展开式：
+            E_up = (empty_mass + payload) * 9.81 * climb
+                   / (climb_efficiency * 3.6e6)
+        不是已确认的题面引文；必须通过配置区核验门禁。
+        """
+        d = self.data
+        return (
+            (d.empty_mass_kg[g] + q) * 9.81 * self.climb_m[i, j]
+            / (d.climb_efficiency[g] * 3.6e6)
+        )
+
+    def segment_energy_kwh(self, g, i, j, q):
+        require(ENERGY_FORMULA_CONFIRMED,
+                "能耗分项公式尚未核验，禁止生成运输结果")
+        return (
+            self.horizontal_energy_kwh(g, i, j, q)
+            + self.climb_energy_kwh(g, i, j, q)
+        )
+
+    def charge_time_s(self, g, soc):
+        require(-1e-9 <= soc <= 1 + 1e-9, f"SOC越界：{soc}")
+        soc = min(1.0, max(0.0, soc))
+        full = self.data.full_charge_time_s[g]
+        if soc < 0.90:
+            return full * (0.65 * (0.90 - soc) / 0.90 + 0.35)
+        return full * 0.35 * (1.0 - soc) / 0.10
+
+    def position(self, node, altitude=None):
+        d = self.data
+        return (
+            d.longitude_deg[node],
+            d.latitude_deg[node],
+            d.operation_altitude_m[node] if altitude is None else altitude,
+        )
+
+
+# ============================================================
+# E. 候选架次与精确物理复算
+# ============================================================
+
+@dataclass
+class Candidate:
+    candidate_id: str
+    uav_type: str
+    boxes: tuple
+    route: tuple
+    prep_s: float
+    duration_s: float
+    energy_kwh: float
+    return_soc: float
+    charge_s: float
+    latest_start_s: float
+    delivery_offset_s: dict
+
+
+def evaluate_candidate(physics, g, boxes, route, with_phases=False):
+    d = physics.data
+    boxes = tuple(sorted(boxes))
+    route = tuple(route)
+    require(len(set(boxes)) == len(boxes), "候选货箱重复")
+    require(
+        len(route) == len(set(route))
+        and set(route) == {d.service_area_of[b] for b in boxes},
+        "候选访问顺序与货箱目的地不一致",
+    )
+    mass = sum(d.cargo_weight_kg[b] for b in boxes)
+    volume = sum(d.cargo_volume_m3[b] for b in boxes)
+    if (
+        mass > d.max_payload_kg[g] + PHYSICAL_TOL
+        or volume > d.max_volume_m3[g] + PHYSICAL_TOL
+    ):
+        return None
+
+    prep = d.prep_time_s[g] + len(boxes) * d.load_time_per_box_s[g]
+    elapsed = prep
+    energy = 0.0
+    remaining = mass
+    delivery = {}
+    phases = []
+
+    if with_phases:
+        phases.append({
+            "phase": "准备装载",
+            "start_offset_s": 0.0,
+            "end_offset_s": prep,
+            "p0": physics.position("O01"),
+            "p1": physics.position("O01"),
+            "payload_kg": mass,
+        })
+
+    current = "O01"
+    for destination in route + ("O01",):
+        cruise = physics.cruise_altitude_m[current, destination]
+        phase_specs = [
+            (
+                "爬升",
+                physics.climb_m[current, destination] / d.climb_speed_mps[g],
+                physics.position(current),
+                physics.position(current, cruise),
+            ),
+            (
+                "巡航",
+                physics.horizontal_distance_m[current, destination]
+                / d.cruise_speed_mps[g],
+                physics.position(current, cruise),
+                physics.position(destination, cruise),
+            ),
+            (
+                "下降",
+                physics.descent_m[current, destination] / d.descent_speed_mps[g],
+                physics.position(destination, cruise),
+                physics.position(destination),
+            ),
+        ]
+        energy += physics.segment_energy_kwh(
+            g, current, destination, remaining
+        )
+        for phase, duration, p0, p1 in phase_specs:
+            if with_phases and duration > 1e-10:
+                phases.append({
+                    "phase": phase,
+                    "start_offset_s": elapsed,
+                    "end_offset_s": elapsed + duration,
+                    "p0": p0,
+                    "p1": p1,
+                    "payload_kg": remaining,
+                })
+            elapsed += duration
+
+        if destination != "O01":
+            local = [b for b in boxes if d.service_area_of[b] == destination]
+            service = (
+                d.handover_base_s[g]
+                + len(local) * d.handover_per_box_s[g]
+            )
+            if with_phases:
+                phases.append({
+                    "phase": "交接",
+                    "start_offset_s": elapsed,
+                    "end_offset_s": elapsed + service,
+                    "p0": physics.position(destination),
+                    "p1": physics.position(destination),
+                    "payload_kg": remaining,
+                })
+            elapsed += service
+            for b in local:
+                delivery[b] = elapsed
+            remaining -= sum(d.cargo_weight_kg[b] for b in local)
+        current = destination
+
+    require(abs(remaining) < 1e-7, "返航载荷未归零")
+    budget = (1.0 - d.reserve_ratio[g]) * d.usable_energy_kwh[g]
+    if energy > budget + PHYSICAL_TOL:
+        return None
+
+    latest = math.inf
+    for b in boxes:
+        if d.hard_deadline_s[b] is not None:
+            latest = min(latest, d.hard_deadline_s[b] - delivery[b])
+    if latest < -1e-8:
+        return None
+    latest = max(0.0, latest)
+
+    soc = 1.0 - energy / d.usable_energy_kwh[g]
+    key = json.dumps([g, boxes, route], ensure_ascii=False)
+    identifier = "K" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    candidate = Candidate(
+        identifier, g, boxes, route, prep, elapsed, energy, soc,
+        physics.charge_time_s(g, soc), latest, delivery,
+    )
+    return (candidate, phases) if with_phases else candidate
+
+
+def candidate_orders(sites):
+    sites = tuple(sorted(sites))
+    require(
+        len(sites) <= EXACT_ORDER_LIMIT,
+        "当前代码仅枚举短路线；请勿在未补充长路线算法时提高max_stops",
+    )
+    return itertools.permutations(sites)
+
+
+def generate_pool(physics, max_stops, previous_pool, logger):
+    """
+    单箱、双箱短路线 + 确定性贪心插入扩充。
+    所有访问顺序在允许的短路线范围内枚举。
+    不是穷举全部货箱子集；生成限制在配置和日志中公开。
+    """
+    d = physics.data
+    pool = dict(previous_pool)
+
+    def add(g, boxes):
+        sites = {d.service_area_of[b] for b in boxes}
+        if len(sites) > max_stops or len(boxes) > MAX_BOXES_PER_CANDIDATE:
+            return []
+        if sum(d.cargo_weight_kg[b] for b in boxes) > d.max_payload_kg[g] + 1e-9:
+            return []
+        if sum(d.cargo_volume_m3[b] for b in boxes) > d.max_volume_m3[g] + 1e-9:
+            return []
+        accepted = []
+        for order in candidate_orders(sites):
+            c = evaluate_candidate(physics, g, boxes, order)
+            if c is not None:
+                pool[c.candidate_id] = c
+                accepted.append(c)
+        return accepted
+
+    box_ids = sorted(d.cargo)
+    for g in sorted(d.uav_types):
+        for b in box_ids:
+            add(g, [b])
+        for pair in itertools.combinations(box_ids, 2):
+            add(g, pair)
+
+        for index, seed in enumerate(box_ids):
+            origin = d.service_area_of[seed]
+            other = [b for b in box_ids if b != seed]
+
+            def dist(b):
+                target = d.service_area_of[b]
+                return (
+                    0.0 if origin == target
+                    else physics.horizontal_distance_m[origin, target]
+                )
+
+            rules = [
+                lambda b: (
+                    d.service_area_of[b] != origin,
+                    dist(b),
+                    d.hard_deadline_s[b] or math.inf,
+                    b,
+                ),
+                lambda b: (
+                    d.hard_deadline_s[b] or math.inf,
+                    dist(b),
+                    -d.priority_weight[b],
+                    b,
+                ),
+                lambda b: (
+                    d.service_area_of[b] != origin,
+                    d.cargo_volume_m3[b] / d.max_volume_m3[g]
+                    + d.cargo_weight_kg[b] / d.max_payload_kg[g],
+                    dist(b),
+                    b,
+                ),
+            ]
+            for rule in rules:
+                selected = [seed]
+                for b in sorted(other, key=rule):
+                    if len(selected) >= MAX_BOXES_PER_CANDIDATE:
+                        break
+                    if add(g, selected + [b]):
+                        selected.append(b)
+            if index % 20 == 0:
+                logger.info(
+                    "候选生成：机型%s，种子%d/%d，累计%d",
+                    g, index + 1, len(box_ids), len(pool),
+                )
+    return pool
+
+
+def choose_candidates(pool, budget, protected_ids):
+    """
+    保留上轮全部候选和每箱每机型可行单箱候选。
+    其余按货箱轮转取候选，避免全局排序只保留少数服务区。
+    """
+    chosen = set(protected_ids)
+    chosen.update(
+        c.candidate_id for c in pool.values() if len(c.boxes) == 1
+    )
+    by_box = defaultdict(list)
+    for c in pool.values():
+        for b in c.boxes:
+            by_box[b].append(c)
+
+    for b, values in by_box.items():
+        # 综合使用交付、持续时间与能耗排序轮换，不改变主目标。
+        values.sort(key=lambda c: (
+            c.duration_s / len(c.boxes),
+            c.delivery_offset_s[b],
+            c.energy_kwh / len(c.boxes),
+            c.candidate_id,
+        ))
+
+    target = max(budget, len(chosen))
+    rank = 0
+    while len(chosen) < target:
+        changed = False
+        for b in sorted(by_box):
+            values = by_box[b]
+            if rank < len(values):
+                c = values[rank]
+                if c.candidate_id not in chosen:
+                    chosen.add(c.candidate_id)
+                    changed = True
+                    if len(chosen) >= target:
+                        break
+        if not changed and all(rank >= len(v) - 1 for v in by_box.values()):
+            break
+        rank += 1
+
+    return [pool[k] for k in sorted(chosen)]
+
+
+# ============================================================
+# F. 构造式基线和初始可行解
+# ============================================================
+
+def greedy_schedule(physics, candidates, single_only=False):
+    """
+    仅作基线/初始解，不将构造失败当作原问题不可行。
+    电池在起飞时就绪，准备可与该电池充电重叠。
+    """
+    d = physics.data
+    allowed = [
+        c for c in candidates
+        if not single_only or len(c.route) == 1
+    ]
+    by_box = defaultdict(list)
+    for c in allowed:
+        for b in c.boxes:
+            by_box[b].append(c)
+
+    remaining = set(d.cargo)
+    uav_ready = {u: 0.0 for u in d.uavs}
+    battery_ready = {c: 0.0 for c in d.batteries}
+    schedule = []
+
+    while remaining:
+        seed = min(remaining, key=lambda b: (
+            d.hard_deadline_s[b] or math.inf,
+            d.expected_delivery_s[b],
+            -d.priority_weight[b],
+            b,
+        ))
+        choices = []
+        for c in by_box[seed]:
+            if not set(c.boxes).issubset(remaining):
+                continue
+            g = c.uav_type
+            u = min(d.uavs_by_type[g], key=lambda x: (uav_ready[x], x))
+            bat = min(
+                d.batteries_by_type[g],
+                key=lambda x: (battery_ready[x], x),
+            )
+            start = max(
+                0.0, uav_ready[u], battery_ready[bat] - c.prep_s
+            )
+            if start > c.latest_start_s + 1e-8:
+                continue
+            tardiness = sum(
+                d.priority_weight[b] * max(
+                    0.0,
+                    start + c.delivery_offset_s[b] - d.expected_delivery_s[b],
+                )
+                for b in c.boxes
+            )
+            score = (
+                tardiness / len(c.boxes),
+                (start + c.duration_s) / len(c.boxes),
+                c.energy_kwh / len(c.boxes),
+                c.candidate_id,
+            )
+            choices.append((score, c, u, bat, start))
+
+        if not choices:
+            return None
+
+        _, c, u, bat, start = min(choices, key=lambda x: x[0])
+        schedule.append({
+            "candidate": c,
+            "uav_id": u,
+            "battery_id": bat,
+            "start_s": start,
+        })
+        uav_ready[u] = start + c.duration_s
+        battery_ready[bat] = start + c.duration_s + c.charge_s
+        remaining.difference_update(c.boxes)
+
+    return schedule
+
+
+# ============================================================
+# G. 联合MILP
+# ============================================================
+
+def solve_joint_milp(physics, candidates, initial, out, label, logger):
+    d = physics.data
+    count = len(candidates)
+    by_id = {c.candidate_id: k for k, c in enumerate(candidates)}
+    cover = {
+        b: [k for k, c in enumerate(candidates) if b in c.boxes]
+        for b in d.cargo
+    }
+    for b, values in cover.items():
+        require(values, f"候选集合没有覆盖货箱{b}")
+
+    # 至多选择80个非空候选。
+    # 对任一可行资源次序左移压紧后，完成时间不超过相应路径
+    # 累计持续时间及充电时间。取最大的80项并加最大期望时间，
+    # 得到保守上界，而不是任意设定一个很短的调度时域。
+    largest = sorted(
+        (c.duration_s + c.charge_s for c in candidates), reverse=True
+    )[:len(d.cargo)]
+    horizon = sum(largest) + max(d.expected_delivery_s.values())
+    max_charge = max(c.charge_s for c in candidates)
+    max_prep = max(c.prep_s for c in candidates)
+    big_m = horizon + max_charge + max_prep
+
+    model = gp.Model(label)
+    model.Params.LogFile = str(out / f"{label}_gurobi.log")
+    model.Params.TimeLimit = TIME_LIMIT_PER_STAGE_S
+    model.Params.Threads = THREADS
+    model.Params.Seed = RANDOM_SEED
+    model.Params.MIPGap = 0.0
+    model.Params.FeasibilityTol = 1e-8
+    model.Params.IntFeasTol = 1e-8
+
+    # 与全局符号表保持一致的核心变量名。
+    trip_selected = model.addVars(count, vtype=GRB.BINARY, name="trip_selected")
+    trip_start_s = model.addVars(
+        count, lb=0.0, ub=horizon, name="trip_start_s"
+    )
+    trip_return_s = model.addVars(
+        count, lb=0.0, ub=horizon, name="trip_return_s"
+    )
+    delivery_time_s = model.addVars(
+        list(d.cargo), lb=0.0, ub=horizon, name="delivery_time_s"
+    )
+    lateness_s = model.addVars(
+        list(d.cargo), lb=0.0, ub=horizon, name="lateness_s"
+    )
+    transport_makespan_s = model.addVar(
+        lb=0.0, ub=horizon, name="transport_makespan_s"
+    )
+
+    uav_keys = [
+        (k, u) for k, c in enumerate(candidates)
+        for u in d.uavs_by_type[c.uav_type]
+    ]
+    battery_keys = [
+        (k, b) for k, c in enumerate(candidates)
+        for b in d.batteries_by_type[c.uav_type]
+    ]
+    uav_assignment = model.addVars(
+        uav_keys, vtype=GRB.BINARY, name="uav_assignment"
+    )
+    battery_assignment = model.addVars(
+        battery_keys, vtype=GRB.BINARY, name="battery_assignment"
+    )
+
+    for b in d.cargo:
+        model.addConstr(
+            gp.quicksum(trip_selected[k] for k in cover[b]) == 1,
+            name=f"unique_delivery_{b}",
+        )
+        model.addConstr(
+            lateness_s[b] >= delivery_time_s[b] - d.expected_delivery_s[b]
+        )
+        if d.is_first_batch[b]:
+            model.addConstr(delivery_time_s[b] <= d.first_deadline_s[b])
+        if d.is_medical[b]:
+            model.addConstr(delivery_time_s[b] <= d.expected_delivery_s[b])
+
+    for k, c in enumerate(candidates):
+        latest = min(horizon - c.duration_s, c.latest_start_s)
+        model.addConstr(trip_start_s[k] <= latest * trip_selected[k])
+        model.addConstr(
+            trip_return_s[k]
+            == trip_start_s[k] + c.duration_s * trip_selected[k]
+        )
+        model.addConstr(transport_makespan_s >= trip_return_s[k])
+        model.addConstr(
+            gp.quicksum(
+                uav_assignment[k, u] for u in d.uavs_by_type[c.uav_type]
+            ) == trip_selected[k]
+        )
+        model.addConstr(
+            gp.quicksum(
+                battery_assignment[k, bat]
+                for bat in d.batteries_by_type[c.uav_type]
+            ) == trip_selected[k]
+        )
+        for b in c.boxes:
+            model.addGenConstrIndicator(
+                trip_selected[k], True,
+                delivery_time_s[b] == trip_start_s[k] + c.delivery_offset_s[b],
+                name=f"delivery_link_{k}_{b}",
+            )
+
+    # 同一候选对只需一个无人机排序变量、一个电池排序变量。
+    # 每架次仅选择一个资源，因此不必为每个编号重复建立排序变量。
+    pair_count = 0
+    box_sets = [set(c.boxes) for c in candidates]
+    for k in range(count):
+        ck = candidates[k]
+        for l in range(k + 1, count):
+            cl = candidates[l]
+            if ck.uav_type != cl.uav_type:
+                continue
+            # 有共同货箱的候选不可能同时选择，无需资源互斥。
+            if box_sets[k] & box_sets[l]:
+                continue
+
+            y = model.addVar(vtype=GRB.BINARY, name=f"uav_order_{k}_{l}")
+            r = model.addVar(vtype=GRB.BINARY, name=f"battery_order_{k}_{l}")
+
+            for u in d.uavs_by_type[ck.uav_type]:
+                ak, al = uav_assignment[k, u], uav_assignment[l, u]
+                model.addConstr(
+                    trip_start_s[l] >= trip_return_s[k]
+                    - big_m * (3 - ak - al - y)
+                )
+                model.addConstr(
+                    trip_start_s[k] >= trip_return_s[l]
+                    - big_m * (2 - ak - al + y)
+                )
+
+            for bat in d.batteries_by_type[ck.uav_type]:
+                bk = battery_assignment[k, bat]
+                bl = battery_assignment[l, bat]
+                model.addConstr(
+                    trip_start_s[l] + cl.prep_s
+                    >= trip_return_s[k] + ck.charge_s
+                    - big_m * (3 - bk - bl - r)
+                )
+                model.addConstr(
+                    trip_start_s[k] + ck.prep_s
+                    >= trip_return_s[l] + cl.charge_s
+                    - big_m * (2 - bk - bl + r)
+                )
+            pair_count += 1
+
+    objectives = [
+        gp.quicksum(
+            d.priority_weight[b] * lateness_s[b] for b in d.cargo
+        ),
+        transport_makespan_s,
+        gp.quicksum(
+            c.energy_kwh * trip_selected[k]
+            for k, c in enumerate(candidates)
+        ),
+        gp.quicksum(trip_selected[k] for k in range(count)),
+    ]
+    objective_names = [
+        "weighted_tardiness", "makespan_s", "energy_kwh", "sorties"
+    ]
+
+    def apply_start(schedule):
+        if not schedule:
+            return
+        ids = {x["candidate"].candidate_id for x in schedule}
+        if not ids.issubset(by_id):
+            return
+        selected_records = {
+            x["candidate"].candidate_id: x for x in schedule
+        }
+        for k, c in enumerate(candidates):
+            item = selected_records.get(c.candidate_id)
+            trip_selected[k].Start = 1 if item else 0
+            trip_start_s[k].Start = item["start_s"] if item else 0
+            trip_return_s[k].Start = (
+                item["start_s"] + c.duration_s if item else 0
+            )
+            for u in d.uavs_by_type[c.uav_type]:
+                uav_assignment[k, u].Start = int(
+                    item is not None and item["uav_id"] == u
+                )
+            for bat in d.batteries_by_type[c.uav_type]:
+                battery_assignment[k, bat].Start = int(
+                    item is not None and item["battery_id"] == bat
+                )
+            if item:
+                for b in c.boxes:
+                    t = item["start_s"] + c.delivery_offset_s[b]
+                    delivery_time_s[b].Start = t
+                    lateness_s[b].Start = max(
+                        0.0, t - d.expected_delivery_s[b]
+                    )
+        transport_makespan_s.Start = raw_metrics(physics, schedule)[1]
+
+    def extract():
+        result = []
+        for k, c in enumerate(candidates):
+            if trip_selected[k].X <= 0.5:
+                continue
+            chosen_u = [
+                u for u in d.uavs_by_type[c.uav_type]
+                if uav_assignment[k, u].X > 0.5
+            ]
+            chosen_b = [
+                bat for bat in d.batteries_by_type[c.uav_type]
+                if battery_assignment[k, bat].X > 0.5
+            ]
+            require(len(chosen_u) == len(chosen_b) == 1,
+                    "求解器返回的资源分配不唯一")
+            result.append({
+                "candidate": c,
+                "uav_id": chosen_u[0],
+                "battery_id": chosen_b[0],
+                "start_s": max(0.0, trip_start_s[k].X),
+            })
+        return result
+
+    model.update()
+    logger.info(
+        "%s：候选%d，需排序候选对%d，变量%d，线性约束%d",
+        label, count, pair_count, model.NumVars, model.NumConstrs,
+    )
+    write_csv(out / f"{label}_model_size.csv", [{
+        "candidate_count": count,
+        "pair_count": pair_count,
+        "variables": model.NumVars,
+        "linear_constraints": model.NumConstrs,
+        "general_constraints": model.NumGenConstrs,
+        "horizon_s": horizon,
+        "big_m": big_m,
+    }])
+
+    apply_start(initial)
+    best = initial
+    stage_records = []
+    all_optimal = True
+
+    for stage, (name, expression, tolerance) in enumerate(
+        zip(objective_names, objectives, LEX_TOLERANCES), 1
+    ):
+        model.setObjective(expression, GRB.MINIMIZE)
+        logger.info("%s：开始第%d层目标 %s", label, stage, name)
+        model.optimize()
+
+        record = {
+            "stage": stage,
+            "objective": name,
+            "status_code": model.Status,
+            "solution_count": model.SolCount,
+            "runtime_s": model.Runtime,
+            "objective_value": None,
+            "best_bound": None,
+            "mip_gap": None,
+            "proven_optimal_current_stage": False,
+            "lock_tolerance": tolerance,
+        }
+
+        if model.SolCount == 0:
+            all_optimal = False
+            stage_records.append(record)
+            if model.Status == GRB.INFEASIBLE and best is None:
+                logger.warning(
+                    "%s：当前候选集合被证明不可行；不代表原问题不可行", label
+                )
+            else:
+                logger.warning(
+                    "%s：本层未找到新解，保留此前可行解（若有）", label
+                )
+            break
+
+        best = extract()
+        optimal = model.Status == GRB.OPTIMAL
+        all_optimal = all_optimal and optimal
+        value = float(expression.getValue()) if hasattr(
+            expression, "getValue"
+        ) else float(expression.X)
+
+        record.update({
+            "objective_value": value,
+            "best_bound": model.ObjBound,
+            "mip_gap": model.MIPGap,
+            "proven_optimal_current_stage": optimal,
+        })
+        stage_records.append(record)
+        logger.info(
+            "%s：%s=%.9g，状态%d，gap=%.6g",
+            label, name, value, model.Status, model.MIPGap,
+        )
+
+        if stage < len(objectives):
+            model.addConstr(
+                expression <= value + tolerance,
+                name=f"lex_lock_{stage}",
+            )
+            apply_start(best)
+
+    write_csv(out / f"{label}_solver_stages.csv", stage_records)
+    report = {
+        "label": label,
+        "candidate_count": count,
+        "four_stages_completed": len(stage_records) == 4
+        and stage_records[-1]["solution_count"] > 0,
+        "all_stages_proven_optimal": all_optimal
+        and len(stage_records) == 4,
+        "scope": "仅针对当前候选集合；允许配置中注明的字典序容差",
+    }
+    model.dispose()
+    return best, report
+
+
+# ============================================================
+# H. 独立约束审计：重算被选路线，不依赖MILP内部辅助变量
+# ============================================================
+
+def audit_schedule(physics, schedule, output_path):
+    d = physics.data
+    rows = []
+
+    def add(name, ok, detail):
+        rows.append({"check": name, "passed": bool(ok), "detail": detail})
+
+    observed = Counter()
+    u_intervals = defaultdict(list)
+    b_intervals = defaultdict(list)
+    deliveries = {}
+
+    for item in schedule:
+        c = item["candidate"]
+        start = item["start_s"]
+        g = c.uav_type
+        fresh = evaluate_candidate(physics, g, c.boxes, c.route)
+        add(
+            f"{c.candidate_id}/物理可行",
+            fresh is not None,
+            "重新检查质量、体积、逐段载荷、能耗及最早交付",
+        )
+        if fresh is None:
+            continue
+
+        add(
+            f"{c.candidate_id}/能耗复算",
+            abs(fresh.energy_kwh - c.energy_kwh) <= AUDIT_ENERGY_TOL_KWH,
+            fresh.energy_kwh,
+        )
+        add(
+            f"{c.candidate_id}/时间复算",
+            abs(fresh.duration_s - c.duration_s) <= AUDIT_TIME_TOL_S,
+            fresh.duration_s,
+        )
+        add(
+            f"{c.candidate_id}/资源兼容",
+            item["uav_id"] in d.uavs_by_type[g]
+            and item["battery_id"] in d.batteries_by_type[g],
+            f"{item['uav_id']}/{item['battery_id']}",
+        )
+        add(
+            f"{c.candidate_id}/开始时刻",
+            start >= -AUDIT_TIME_TOL_S,
+            start,
+        )
+        add(
+            f"{c.candidate_id}/返航SOC",
+            fresh.return_soc >= d.reserve_ratio[g] - 1e-8,
+            fresh.return_soc,
+        )
+
+        end = start + fresh.duration_s
+        u_intervals[item["uav_id"]].append(
+            (start, end, c.candidate_id)
+        )
+        b_intervals[item["battery_id"]].append(
+            (start + fresh.prep_s, end + fresh.charge_s, c.candidate_id)
+        )
+        for b in c.boxes:
+            observed[b] += 1
+            t = start + fresh.delivery_offset_s[b]
+            deliveries[b] = t
+            if d.is_first_batch[b]:
+                add(
+                    f"{b}/首批时限",
+                    t <= d.first_deadline_s[b] + AUDIT_TIME_TOL_S,
+                    f"{t:.9f} <= {d.first_deadline_s[b]}",
+                )
+            if d.is_medical[b]:
+                add(
+                    f"{b}/医疗时限",
+                    t <= d.expected_delivery_s[b] + AUDIT_TIME_TOL_S,
+                    f"{t:.9f} <= {d.expected_delivery_s[b]}",
+                )
+
+    add(
+        "80箱恰好交付一次",
+        set(observed) == set(d.cargo)
+        and all(observed[b] == 1 for b in d.cargo),
+        dict(observed),
+    )
+
+    for label, intervals in [
+        ("无人机", u_intervals), ("电池飞行及充电", b_intervals)
+    ]:
+        for resource, tasks in intervals.items():
+            tasks.sort()
+            for previous, following in zip(tasks[:-1], tasks[1:]):
+                add(
+                    f"{label}/{resource}/{previous[2]}->{following[2]}",
+                    following[0] + AUDIT_TIME_TOL_S >= previous[1],
+                    f"下一次开始{following[0]}，前次释放{previous[1]}",
+                )
+
+    write_csv(output_path, rows)
+    return all(r["passed"] for r in rows)
+
+
+# ============================================================
+# I. 输出接口、轨迹及统计
+# ============================================================
+
+def export_results(physics, schedule, out, run_id, solver_report):
+    d = physics.data
+    schedule = sorted(
+        schedule,
+        key=lambda x: (x["start_s"], x["uav_id"],
+                       x["candidate"].candidate_id),
+    )
+    trips, deliveries, uav_timeline, battery_timeline = [], [], [], []
+    trajectory, trajectory_segments = [], []
+
+    for index, item in enumerate(schedule, 1):
+        trip_id = f"T{index:03d}"
+        c = item["candidate"]
+        start = item["start_s"]
+        fresh, phases = evaluate_candidate(
+            physics, c.uav_type, c.boxes, c.route, with_phases=True
+        )
+        end = start + fresh.duration_s
+        takeoff = start + fresh.prep_s
+
+        # 强制接口字段均保留，扩展字段在其后。
+        trips.append({
+            "trip_id": trip_id,
+            "uav_id": item["uav_id"],
+            "uav_type": c.uav_type,
+            "battery_id": item["battery_id"],
+            "start_s": start,
+            "route": encode_list(("O01",) + c.route + ("O01",)),
+            "return_s": end,
+            "energy_kwh": fresh.energy_kwh,
+            "takeoff_s": takeoff,
+            "cargo_ids": encode_list(c.boxes),
+            "candidate_id": c.candidate_id,
+            "payload_kg": sum(d.cargo_weight_kg[b] for b in c.boxes),
+            "volume_m3": sum(d.cargo_volume_m3[b] for b in c.boxes),
+            "return_soc": fresh.return_soc,
+            "run_id": run_id,
+        })
+
+        for b in c.boxes:
+            delivered = start + fresh.delivery_offset_s[b]
+            deliveries.append({
+                "cargo_id": b,
+                "trip_id": trip_id,
+                "service_area": d.service_area_of[b],
+                "delivery_s": delivered,
+                "cargo_type": d.cargo[b]["cargo_type"],
+                "is_first_batch": d.is_first_batch[b],
+                "is_medical": d.is_medical[b],
+                "first_deadline_s": d.first_deadline_s[b],
+                "expected_delivery_s": d.expected_delivery_s[b],
+                "hard_deadline_s": d.hard_deadline_s[b],
+                "lateness_s": max(0.0, delivered - d.expected_delivery_s[b]),
+                "priority_weight": d.priority_weight[b],
+                "run_id": run_id,
+            })
+
+        for phase in phases:
+            a = start + phase["start_offset_s"]
+            z = start + phase["end_offset_s"]
+            p0, p1 = phase["p0"], phase["p1"]
+            uav_timeline.append({
+                "uav_id": item["uav_id"],
+                "trip_id": trip_id,
+                "phase": phase["phase"],
+                "start_s": a,
+                "end_s": z,
+                "run_id": run_id,
+            })
+            trajectory_segments.append({
+                "trip_id": trip_id,
+                "phase": phase["phase"],
+                "start_s": a,
+                "end_s": z,
+                "start_lon_deg": p0[0],
+                "start_lat_deg": p0[1],
+                "start_altitude_m": p0[2],
+                "end_lon_deg": p1[0],
+                "end_lat_deg": p1[1],
+                "end_altitude_m": p1[2],
+                "payload_kg": phase["payload_kg"],
+                "interpolation": "linear_in_lon_lat_altitude",
+            })
+            pieces = max(1, math.ceil((z - a) / TRAJECTORY_STEP_S))
+            for fraction in np.linspace(0.0, 1.0, pieces + 1):
+                point = [
+                    p0[j] + fraction * (p1[j] - p0[j]) for j in range(3)
+                ]
+                trajectory.append({
+                    "trip_id": trip_id,
+                    "time_s": a + fraction * (z - a),
+                    "phase": phase["phase"],
+                    "lon_deg": point[0],
+                    "lat_deg": point[1],
+                    "altitude_m": point[2],
+                    "payload_kg": phase["payload_kg"],
+                })
+
+        battery_timeline.extend([
+            {
+                "battery_id": item["battery_id"],
+                "uav_type": c.uav_type,
+                "trip_id": trip_id,
+                "phase": "任务占用",
+                "start_s": takeoff,
+                "end_s": end,
+                "soc_start": 1.0,
+                "soc_end": fresh.return_soc,
+                "run_id": run_id,
+            },
+            {
+                "battery_id": item["battery_id"],
+                "uav_type": c.uav_type,
+                "trip_id": trip_id,
+                "phase": "充电",
+                "start_s": end,
+                "end_s": end + fresh.charge_s,
+                "soc_start": fresh.return_soc,
+                "soc_end": 1.0,
+                "run_id": run_id,
+            },
+        ])
+
+    deliveries.sort(key=lambda r: r["cargo_id"])
+    write_csv(out / "q2_transport_trips.csv", trips)
+    write_csv(out / "q2_cargo_delivery.csv", deliveries)
+    write_csv(out / "q2_uav_timeline.csv", uav_timeline)
+    write_csv(out / "q2_battery_timeline.csv", battery_timeline)
+    write_csv(out / "q2_trajectories.csv", trajectory)
+    write_csv(out / "q2_trajectory_segments.csv", trajectory_segments)
+
+    metrics = raw_metrics(physics, schedule)
+    makespan = metrics[1]
+    resource_usage = []
+    for u in d.uavs:
+        busy = sum(
+            r["return_s"] - r["start_s"] for r in trips if r["uav_id"] == u
+        )
+        resource_usage.append({
+            "resource_type": "无人机",
+            "resource_id": u,
+            "task_busy_s": busy,
+            "charge_busy_s_within_makespan": 0.0,
+            "utilization": busy / makespan,
+            "horizon_s": makespan,
+        })
+    for bat in d.batteries:
+        task = sum(
+            max(0.0, min(r["end_s"], makespan) - r["start_s"])
+            for r in battery_timeline
+            if r["battery_id"] == bat and r["phase"] == "任务占用"
+        )
+        charging = sum(
+            max(0.0, min(r["end_s"], makespan) - r["start_s"])
+            for r in battery_timeline
+            if r["battery_id"] == bat and r["phase"] == "充电"
+        )
+        resource_usage.append({
+            "resource_type": "电池",
+            "resource_id": bat,
+            "task_busy_s": task,
+            "charge_busy_s_within_makespan": charging,
+            "utilization": (task + charging) / makespan,
+            "horizon_s": makespan,
+        })
+    write_csv(out / "q2_resource_utilization.csv", resource_usage)
+    write_csv(out / "q2_metrics.csv", [{
+        "weighted_tardiness": metrics[0],
+        "transport_makespan_s": metrics[1],
+        "total_energy_kwh": metrics[2],
+        "sorties": metrics[3],
+        "delivered_boxes": len(deliveries),
+        "run_id": run_id,
+        **solver_report,
+    }])
+    return trips, deliveries, uav_timeline, battery_timeline, resource_usage
+
+
+# ============================================================
+# J. 可视化
+# ============================================================
+
+def make_figures(physics, exported, out, logger):
+    import matplotlib
+
+    if SHOW_FIGURES:
+        matplotlib.use("TkAgg")
+    else:
+        matplotlib.use("Agg")
+
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+    from matplotlib.patches import Patch
+
+    if CHINESE_FONT_PATH:
+        require(Path(CHINESE_FONT_PATH).is_file(), "指定中文字体不存在")
+        font_manager.fontManager.addfont(CHINESE_FONT_PATH)
+        font_name = font_manager.FontProperties(
+            fname=CHINESE_FONT_PATH
+        ).get_name()
+    else:
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        preferred = [
+            "Microsoft YaHei", "SimHei", "Noto Sans CJK SC",
+            "Source Han Sans SC", "SimSun",
+        ]
+        font_name = next((n for n in preferred if n in available), None)
+        require(
+            font_name is not None,
+            "未找到中文字体，请填写CHINESE_FONT_PATH后重新绘图",
+        )
+    plt.rcParams["font.sans-serif"] = [font_name]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    trips, deliveries, uav_timeline, battery_timeline, usage = exported
+    d = physics.data
+
+    def finish(fig, filename):
+        fig.tight_layout()
+        fig.savefig(out / filename, dpi=FIGURE_DPI, bbox_inches="tight")
+        if not SHOW_FIGURES:
+            plt.close(fig)
+
+    # 1. 运输路线：颜色表示机型，线路标签表示架次。
+    colors = {"A": "#2878B5", "B": "#E89818", "C": "#3B8E5A"}
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for trip in trips:
+        route = json.loads(trip["route"])
+        xs = [d.longitude_deg[i] for i in route]
+        ys = [d.latitude_deg[i] for i in route]
+        ax.plot(xs, ys, color=colors[trip["uav_type"]], alpha=0.55, lw=1.1)
+        if len(route) > 2:
+            mid = route[1]
+            ax.annotate(
+                trip["trip_id"],
+                (d.longitude_deg[mid], d.latitude_deg[mid]),
+                fontsize=6, alpha=0.65,
+            )
+    for i in d.nodes:
+        marker = "*" if i == "O01" else "o"
+        ax.scatter(
+            d.longitude_deg[i], d.latitude_deg[i],
+            marker=marker, s=150 if i == "O01" else 30, color="black",
+        )
+        ax.annotate(
+            i, (d.longitude_deg[i], d.latitude_deg[i]),
+            xytext=(4, 4), textcoords="offset points", fontsize=8,
+        )
+    ax.set(
+        title="第二问运输路线",
+        xlabel="经度（°）", ylabel="纬度（°）",
+    )
+    ax.legend(handles=[
+        Patch(color=colors[g], label=f"{g}型") for g in colors
+    ])
+    ax.grid(alpha=0.2)
+    finish(fig, "q2_routes.png")
+
+    # 2. 无人机甘特图。
+    phase_colors = {
+        "准备装载": "#A6A6A6",
+        "爬升": "#76B7B2",
+        "巡航": "#4E79A7",
+        "下降": "#59A14F",
+        "交接": "#F28E2B",
+    }
+    resources = sorted(d.uavs)
+    fig, ax = plt.subplots(figsize=(13, 5))
+    for r in uav_timeline:
+        y = resources.index(r["uav_id"])
+        ax.barh(
+            y, (r["end_s"] - r["start_s"]) / 60,
+            left=r["start_s"] / 60, height=0.65,
+            color=phase_colors[r["phase"]],
+        )
+    ax.set_yticks(range(len(resources)), resources)
+    ax.set(title="运输无人机作业甘特图", xlabel="时间（min）", ylabel="无人机")
+    ax.legend(
+        handles=[Patch(color=v, label=k) for k, v in phase_colors.items()],
+        ncol=5, loc="upper center", bbox_to_anchor=(0.5, 1.15),
+    )
+    ax.grid(axis="x", alpha=0.2)
+    finish(fig, "q2_uav_gantt.png")
+
+    # 3. 电池周转甘特图。
+    resources = sorted(d.batteries)
+    fig, ax = plt.subplots(figsize=(13, 7))
+    for r in battery_timeline:
+        y = resources.index(r["battery_id"])
+        ax.barh(
+            y, (r["end_s"] - r["start_s"]) / 60,
+            left=r["start_s"] / 60, height=0.65,
+            color="#4E79A7" if r["phase"] == "任务占用" else "#F28E2B",
+        )
+    ax.set_yticks(range(len(resources)), resources)
+    ax.set(title="共享电池任务与充电时间线", xlabel="时间（min）", ylabel="电池")
+    ax.legend(handles=[
+        Patch(color="#4E79A7", label="任务占用"),
+        Patch(color="#F28E2B", label="充电"),
+    ])
+    ax.grid(axis="x", alpha=0.2)
+    finish(fig, "q2_battery_gantt.png")
+
+    # 4. 逐箱交付与时间要求。
+    fig, ax = plt.subplots(figsize=(15, 6))
+    x = np.arange(len(deliveries))
+    actual = [r["delivery_s"] / 60 for r in deliveries]
+    expected = [r["expected_delivery_s"] / 60 for r in deliveries]
+    ax.scatter(x, actual, s=17, label="实际交付", color="#2878B5")
+    ax.scatter(x, expected, s=18, marker="_", label="期望时间", color="#777777")
+    hard_x = [i for i, r in enumerate(deliveries)
+              if r["hard_deadline_s"] is not None]
+    hard_y = [deliveries[i]["hard_deadline_s"] / 60 for i in hard_x]
+    ax.scatter(hard_x, hard_y, s=25, marker="x",
+               label="有效硬截止", color="#C23B22")
+    ax.set_xticks(x, [r["cargo_id"] for r in deliveries], rotation=90, fontsize=6)
+    ax.set(title="逐箱交付与时限对照", xlabel="货箱编号", ylabel="时间（min）")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.2)
+    finish(fig, "q2_delivery_deadlines.png")
+
+    # 5. 资源利用率：统一使用运输最晚返航时刻作为统计窗口。
+    fig, ax = plt.subplots(figsize=(13, 5))
+    labels = [r["resource_id"] for r in usage]
+    task = [r["task_busy_s"] / r["horizon_s"] for r in usage]
+    charge = [
+        r["charge_busy_s_within_makespan"] / r["horizon_s"] for r in usage
+    ]
+    ax.bar(labels, task, label="任务占用", color="#4E79A7")
+    ax.bar(labels, charge, bottom=task, label="充电占用", color="#F28E2B")
+    ax.set(
+        title="资源利用率（截至最晚返航时刻）",
+        xlabel="资源编号", ylabel="占调度时域比例", ylim=(0, 1.05),
+    )
+    ax.legend()
+    ax.grid(axis="y", alpha=0.2)
+    finish(fig, "q2_resource_utilization.png")
+
+    logger.info("已保存5类图件")
+    if SHOW_FIGURES:
+        plt.show()
+
+
+# ============================================================
+# K. 实验记录与主流程
+# ============================================================
+
+def candidate_records(candidates):
+    for c in candidates:
+        yield {
+            "candidate_id": c.candidate_id,
+            "uav_type": c.uav_type,
+            "cargo_ids": encode_list(c.boxes),
+            "route": encode_list(c.route),
+            "prep_s": c.prep_s,
+            "duration_s": c.duration_s,
+            "energy_kwh": c.energy_kwh,
+            "return_soc": c.return_soc,
+            "charge_s": c.charge_s,
+            "latest_start_s": (
+                c.latest_start_s if math.isfinite(c.latest_start_s) else None
+            ),
+            "delivery_offsets": json.dumps(
+                c.delivery_offset_s, ensure_ascii=False
+            ),
+        }
+
+
+def export_manifest(data, physics, out):
+    records = []
+    files = list(data.source_files) + [physics.dem_path]
+    files.extend(
+        PROTOCOL_ROOT / name for name in PROTOCOL_FILES
+        if (PROTOCOL_ROOT / name).is_file()
+    )
+    if "__file__" in globals():
+        script = Path(__file__).resolve()
+        if script.is_file():
+            files.append(script)
+    for path in files:
+        records.append({
+            "path": str(path.resolve()),
+            "bytes": path.stat().st_size,
+            "sha256": sha256(path),
+        })
+    write_csv(out / "source_manifest.csv", records)
+
+
+def main():
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out = OUTPUT_ROOT / run_id
+    out.mkdir(parents=True, exist_ok=False)
+    logger = init_logging(out)
+    begin = time.perf_counter()
+
+    configuration = {
+        "code_version": CODE_VERSION,
+        "run_id": run_id,
+        "data_root": str(DATA_ROOT),
+        "protocol_root": str(PROTOCOL_ROOT),
+        "output_directory": str(out),
+        "energy_formula_confirmed": ENERGY_FORMULA_CONFIRMED,
+        "energy_formula_source": ENERGY_FORMULA_SOURCE,
+        "candidate_rounds": CANDIDATE_ROUNDS,
+        "max_boxes_per_candidate": MAX_BOXES_PER_CANDIDATE,
+        "exact_order_limit": EXACT_ORDER_LIMIT,
+        "time_limit_per_stage_s": TIME_LIMIT_PER_STAGE_S,
+        "lex_tolerances": LEX_TOLERANCES,
+        "battery_occupation_start": "takeoff",
+        "trip_start_definition": "preparation_start",
+        "delivery_definition": "handover_complete",
+        "alns_enabled": False,
+        "trajectory_step_s": TRAJECTORY_STEP_S,
+        "command": " ".join(sys.argv),
+    }
+    write_csv(out / "run_config.csv", [
+        {
+            "parameter": key,
+            "value": json.dumps(value, ensure_ascii=False)
+            if isinstance(value, (list, dict)) else value,
+        }
+        for key, value in configuration.items()
+    ])
+    write_csv(out / "protocol_alignment.csv", [
+        {
+            "item": "符号和接口",
+            "implementation": "沿用00和06中的变量语义、单位及强制输出字段",
+        },
+        {
+            "item": "ALNS",
+            "implementation": "按前文最终方案不启用；03文件该项属于旧方案",
+        },
+        {
+            "item": "实体机与电池",
+            "implementation": "分别互斥；电池从起飞到返航充满占用",
+        },
+        {
+            "item": "能耗",
+            "implementation": "分项待核验；未确认时不输出运输结果",
+        },
+        {
+            "item": "单点基线",
+            "implementation": "本程序重建单点贪心基线，不冒称Q1最优组批",
+        },
+        {
+            "item": "最优性",
+            "implementation": "仅在实际生成的候选集合与报告容差范围内",
+        },
+    ])
+
+    try:
+        logger.info("STAGE A：原始数据读取与一致性检查")
+        data = InputData(DATA_ROOT, out, logger)
+
+        logger.info("STAGE B：公共航段物理参数")
+        physics = Physics(data, out, logger)
+        export_manifest(data, physics, out)
+
+        require(
+            ENERGY_FORMULA_CONFIRMED and bool(ENERGY_FORMULA_SOURCE.strip()),
+            "能耗分项公式尚未完成核验。请核对两个能耗函数，填写"
+            "ENERGY_FORMULA_SOURCE，并确认ENERGY_FORMULA_CONFIRMED。"
+            "本次仅保存数据检查与航段几何结果，不生成未经确认的运输解。",
+        )
+
+        best = None
+        best_report = {}
+        selected_previous = []
+        pool = {}
+        experiments = []
+
+        for round_index, setting in enumerate(CANDIDATE_ROUNDS, 1):
+            require(setting["max_stops"] <= EXACT_ORDER_LIMIT,
+                    "候选服务区上限超过访问顺序枚举上限")
+            label = f"round_{round_index}"
+            logger.info("STAGE C：%s 候选生成", label)
+            pool = generate_pool(
+                physics, setting["max_stops"], pool, logger
+            )
+
+            protected = {c.candidate_id for c in selected_previous}
+            if best:
+                protected.update(x["candidate"].candidate_id for x in best)
+            candidates = choose_candidates(
+                pool, setting["budget"], protected
+            )
+            selected_previous = candidates
+            write_csv(
+                out / f"{label}_candidates.csv",
+                candidate_records(candidates),
+            )
+            logger.info(
+                "%s：原始池%d，进入联合模型%d", label, len(pool), len(candidates)
+            )
+
+            baselines = {}
+            for name, single in [
+                ("单点贪心基线", True),
+                ("多点贪心基线", False),
+            ]:
+                plan = greedy_schedule(physics, candidates, single_only=single)
+                feasible = False
+                if plan is not None:
+                    feasible = audit_schedule(
+                        physics, plan,
+                        out / f"{label}_{'single' if single else 'multi'}_audit.csv",
+                    )
+                if not feasible:
+                    plan = None
+                baselines[name] = plan
+                metrics = raw_metrics(physics, plan)
+                experiments.append({
+                    "round": round_index,
+                    "method": name,
+                    "feasible": feasible,
+                    "candidate_count": len(candidates),
+                    "weighted_tardiness": metrics[0] if metrics else None,
+                    "makespan_s": metrics[1] if metrics else None,
+                    "energy_kwh": metrics[2] if metrics else None,
+                    "sorties": metrics[3] if metrics else None,
+                    "all_stages_proven_optimal": False,
+                })
+
+            starts = [p for p in [best, *baselines.values()] if p]
+            initial = min(
+                starts, key=lambda p: raw_metrics(physics, p)
+            ) if starts else None
+
+            logger.info("STAGE D：%s 联合资源与时间优化", label)
+            plan, report = solve_joint_milp(
+                physics, candidates, initial, out, label, logger
+            )
+            feasible = (
+                plan is not None and audit_schedule(
+                    physics, plan, out / f"{label}_constraint_audit.csv"
+                )
+            )
+            metrics = raw_metrics(physics, plan) if feasible else None
+            experiments.append({
+                "round": round_index,
+                "method": "候选架次与双资源联合MILP",
+                "feasible": feasible,
+                "candidate_count": len(candidates),
+                "weighted_tardiness": metrics[0] if metrics else None,
+                "makespan_s": metrics[1] if metrics else None,
+                "energy_kwh": metrics[2] if metrics else None,
+                "sorties": metrics[3] if metrics else None,
+                "all_stages_proven_optimal":
+                    report["all_stages_proven_optimal"],
+            })
+            if plan is not None and not feasible:
+                raise RuntimeError(
+                    "优化器返回方案未通过独立审计，停止正式输出，"
+                    "请检查该轮constraint_audit.csv"
+                )
+            if feasible:
+                # 新轮包含旧轮候选；优先输出最新轮已审计的求解结果，
+                # 同时避免超时导致严格指标退化。
+                if best is None or raw_metrics(
+                    physics, plan
+                ) <= raw_metrics(physics, best):
+                    best = plan
+                    best_report = report
+
+            write_csv(out / "q2_experiment_comparison.csv", experiments)
+
+        require(
+            best is not None,
+            "当前候选及时间预算内未取得完整可行解。"
+            "请查看求解状态并扩充候选/增加时间；不能据此判定原题无解。",
+        )
+        require(
+            audit_schedule(physics, best, out / "q2_constraint_audit.csv"),
+            "最终方案未通过约束审计",
+        )
+
+        logger.info("STAGE E：导出运输、交付、资源及轨迹")
+        exported = export_results(
+            physics, best, out, run_id, best_report
+        )
+        metrics = raw_metrics(physics, best)
+        logger.info(
+            "最终结果：加权迟到=%.6f，最晚返航=%.6f s，"
+            "能耗=%.6f kWh，架次数=%d",
+            *metrics,
+        )
+
+        write_csv(out / "artifact_manifest.csv", [
+            {
+                "run_id": run_id,
+                "filename": p.name,
+                "bytes": p.stat().st_size,
+                "code_version": CODE_VERSION,
+            }
+            for p in sorted(out.iterdir()) if p.is_file()
+        ])
+
+        logger.info("STAGE F：保存并显示图件")
+        make_figures(physics, exported, out, logger)
+        write_csv(out / "artifact_manifest.csv", [
+            {
+                "run_id": run_id,
+                "filename": p.name,
+                "bytes": p.stat().st_size,
+                "code_version": CODE_VERSION,
+            }
+            for p in sorted(out.iterdir())
+            if p.is_file() and p.name != "artifact_manifest.csv"
+        ])
+        logger.info(
+            "完成，耗时%.2f s；输出目录：%s",
+            time.perf_counter() - begin, out,
+        )
+
+    except Exception as exc:
+        logger.error("停止：%s", exc)
+        logger.error(traceback.format_exc())
+        write_csv(out / "run_failure.csv", [{
+            "run_id": run_id,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "elapsed_s": time.perf_counter() - begin,
+        }])
+        raise
+
+
+if __name__ == "__main__":
+    main()
